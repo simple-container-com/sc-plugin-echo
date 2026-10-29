@@ -27,7 +27,6 @@ import (
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/pkg/errors"
-
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
 	"github.com/simple-container-com/api/pkg/api"
@@ -210,6 +209,47 @@ func (p *echoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReq
 	}
 	p.progress.Info("provision", fmt.Sprintf("resource %q registered (urn=%s)", req.GetResourceName(), urnStr))
 	return &scpluginv1.ProvisionResponse{Urn: urnStr}, nil
+}
+
+// ComputeProcess is called by SC core for each dependency resource a
+// consuming stack declares. The echo stub exercises the full
+// ComputeResultBuilder surface — plain + secret env vars, resource and
+// dependency template extensions — so an operator can see what crosses
+// the Phase 1e v2 wire. A real plugin's ComputeProcessor opens a
+// StackReference against ParentInfo (req.GetParentInfoJson), reads
+// previously-exported outputs, and translates them into env vars
+// consuming stacks use.
+//
+// What is NOT demonstrated here (not representable on the bus — see
+// pkg/plugin/compute.go doc): sdk.Resource dependencies, sdk.Output
+// values, pre/post-processors. Those stay in-plugin and apply against
+// the plugin's own sdk.Context before Build.
+func (p *echoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
+	p.progress.Info("compute-process", fmt.Sprintf("resource=%q type=%q", req.GetResourceName(), req.GetResourceType()))
+	resp, err := echoInternal.ComputeProcess(req)
+	if err != nil {
+		p.progress.Error("compute-process", err.Error())
+		return nil, err
+	}
+	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
+	return resp, nil
+}
+
+// PreDestroy is called by SC core before Pulumi's destroy phase, with
+// stack outputs + the per-env client descriptor + destroy params all
+// packed onto the wire (Phase 1e v2). The echo stub narrates what
+// crossed; a real plugin runs cloud-specific cleanup (mongodb drops
+// databases named in service-user outputs, etc.).
+//
+// Deliberately NOT returning a gRPC error even when the hook decides
+// not to run — SC core's sidecar is fire-and-forget on the response,
+// so an error here would only show up in the plugin's own log and
+// never block the destroy.
+func (p *echoPlugin) PreDestroy(ctx context.Context, req *scpluginv1.PreDestroyRequest) (*scpluginv1.PreDestroyResponse, error) {
+	if err := echoInternal.PreDestroy(ctx, p.progress, req); err != nil {
+		p.progress.Error("pre-destroy", err.Error())
+	}
+	return &scpluginv1.PreDestroyResponse{}, nil
 }
 
 // VmHosts converges a VM resource whose `provider:` names a driver this

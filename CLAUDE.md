@@ -27,14 +27,27 @@ a `gh repo create --template` and a grep-replace of `echo` away.
   - `Schema()` echoes every owned token into the proto, plus
     `PulumiPlugins` (the SDKs this plugin links against) and
     `VmDrivers` (the vm.Drivers table rows this plugin owns).
-  - `pulumiContextFromHeader` opens ONE `sdk.Context` per RPC against
-    the monitor address in the request header. Reusing a context
-    across RPCs produces resources that cannot be addressed from the
-    right monitor.
-  - `waitForRef` is the countermeasure for Pulumi's async
-    RegisterResource — a handler that returns before its outputs
-    resolve lets `defer pctx.Close()` tear the engine connection down
-    mid-registration, and the deploy hangs with no error.
+  - Every handler opens ONE Pulumi context per RPC via
+    `runtime.NewContext(stdctx, header, runtime.WithLocalEngineFallback(p.progress))`
+    and defers `runtime.Settle(rctx, &resp, &err)`. The handler's named
+    return values must be `(resp *T, err error)` for Settle to fold them.
+    Reusing a context across RPCs produces resources that cannot be
+    addressed from the right monitor; skipping Settle lets Pulumi's
+    teardown drop pending RegisterResource goroutines (trap 1).
+  - `runtime.HarvestExports(stdctx, rctx.Pulumi)` is how Provision gets
+    its `Outputs` field. Any `rctx.Pulumi.Export(k, out)` call is what
+    makes a `uses:` consumer able to read the value. Lose this and
+    `uses:` returns "output not found" (traps 3 + 4).
+  - `scCoreRegistrarBridge` is a commented stub showing the cross-plugin
+    bridge pattern. The `ctx.Export(unique-key, urnOut)` inside each
+    bridge method is a FORCING FUNCTION — remove it and Pulumi
+    dead-strips the orphan ApplyT when callers discard the
+    ResourceOutput, and the PeerInvoke never fires (trap 15).
+  - `plugin/internal/registrar.go`'s `ProvisionEcho` carries the
+    URN-vs-export-key split comment. When a derived plugin introduces an
+    operator-nameable knob (`clusterName:`, `bucketName:`), the knob
+    goes into export keys and cloud-side names but NEVER into the second
+    argument to `RegisterResource` (trap 13).
 
 - `/plugin/internal/urn_contract_test.go` — the gate that locks the
   URN name contract. Uses `pulumi.NewContext` + `RunInfo.Mocks`,
@@ -58,6 +71,12 @@ cd plugin && go test ./...
 ```
 
 Both must stay green on `main`.
+
+## The traps this template already prevents
+
+See [TRAPS.md](TRAPS.md) — fifteen named traps from the five-plugin
+extraction wave, with the mechanism this template encodes against each.
+The grep-checklist in that file is the minimum pre-release lint pass.
 
 ## Writing a new plugin from this template
 

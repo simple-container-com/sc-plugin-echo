@@ -7,13 +7,47 @@
 // canned-success stub, so `go build ./...` + `go test ./...` pass against
 // the template untouched, and so an author can grep for `echo` and
 // replace it piece by piece without having to re-derive the file layout
-// or the common scaffolding (pulumiContextFromHeader, waitForRef,
-// LogStream, strVal, main()).
+// or the common scaffolding.
 //
 // What it does NOT do: provision anything real. The resources registered
 // below are pure Pulumi ComponentResources — logical URN groupings with
 // no cloud side-effects. An author swaps the body of each RPC for the
 // real cloud-driven work; the surrounding structure stays.
+//
+// # Trap-prevention invariants baked in
+//
+// This template encodes the invariants the five-plugin extraction wave
+// paid for (sc-plugin-aws / cloudflare / cloudru / mongodb / yandex,
+// 2026-10-18 → 2026-11-01). See TRAPS.md for the fifteen-trap index and
+// forge/docs/design/2026-11-01/plugin-extraction-playbook/ for the
+// canonical catalogue. The ones already lived here, do not undo them:
+//
+//   - Every handler uses `runtime.NewContext(stdctx, header, …)` +
+//     `defer runtime.Settle(rctx, &resp, &err)`. The template never calls
+//     `pctx.Close()` directly — `Settle` drains outstanding
+//     RegisterResource goroutines via `go:linkname` into
+//     `(*Context).wait`, then closes the SDK context. (Trap 7, cascade
+//     recovery 2026-10-27.)
+//
+//   - Provision returns `runtime.HarvestExports` output as
+//     ProvisionResponse.Outputs. Any `rctx.Pulumi.Export(k, out)` call a
+//     real plugin adds crosses the wire with the Secret flag preserved.
+//     (Traps 10/11, forge-storage + aws harvest 2026-10-30 / 10-31.)
+//
+//   - The template demonstrates one `pctx.Export(...)` in Provision so an
+//     author sees HarvestExports actually populate Outputs. Delete it and
+//     consumers that `uses: [echo-bucket]` get `output "..." not found`.
+//
+//   - `scCoreRegistrarBridge` below is a commented stub for the
+//     cross-plugin registrar bridge pattern (D8, PeerInvoke). It ships
+//     the mandatory `ctx.Export(unique-key, urnOut)` forcing function
+//     inside each bridge method — without it Pulumi dead-strips the
+//     orphan ApplyT when callers discard the ResourceOutput. (Trap 15,
+//     forge-notifier 2026-11-01.)
+//
+//   - See `plugin/internal/registrar.go` for the URN-vs-export-key split
+//     comment every operator-nameable resource must honour. (Trap 13,
+//     forge-notifier mongodb cluster rename 2026-11-01.)
 //
 // See `docs/docs/guides/plugin-authoring.md` in the api repo for the
 // walkthrough: config tier → provisioning tier → tests → release.
@@ -26,13 +60,14 @@ import (
 	"sync"
 
 	hclog "github.com/hashicorp/go-hclog"
+	hplugin "github.com/hashicorp/go-plugin"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/clouds/vm"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 
 	echoApi "github.com/simple-container-com/sc-plugin-echo/api"
 	echoInternal "github.com/simple-container-com/sc-plugin-echo/plugin/internal"
@@ -54,7 +89,22 @@ type echoPlugin struct {
 	// the whole of a multi-step RPC chain — operators see nothing until
 	// the deploy either succeeds or fails much later.
 	progress *scPlugin.Publisher
+
+	// broker is captured on the Impl by SetBroker when hashicorp/go-plugin
+	// hands it to GRPCServer. Required for the SCCore callback stream a
+	// composite plugin uses (PeerInvoke to another plugin, or
+	// ResolveSecret / ResolveCredential against SC core). Nil until the
+	// go-plugin lifecycle has run, so handlers that need it must guard.
+	// The echo template keeps this field + SetBroker so a derived plugin
+	// does not have to re-derive the BrokerAware shape.
+	broker *hplugin.GRPCBroker
 }
+
+// SetBroker implements scPlugin.BrokerAware. api/pkg/plugin/goplugin.go's
+// scCloudPlugin.GRPCServer type-asserts the Impl against this interface
+// and calls SetBroker when it exists; without it, scPlugin.NewPeerClient
+// returns "nil broker" and PeerInvoke never dials.
+func (p *echoPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 
 // Schema is the first RPC SC core calls. The response advertises every
 // token this plugin owns, both at config-parse time (so core routes
@@ -112,32 +162,17 @@ func echoVmDriverSpec() *scpluginv1.VmDriverSpec {
 	}
 }
 
-// pulumiContextFromHeader opens a short-lived pulumi.Context against the
-// monitor address SC core puts in the request header. One per RPC — the
-// scope of a Pulumi context is the scope of an RPC, and reusing a context
-// across RPCs produces resources that cannot be addressed from the right
-// monitor.
+// ProvisionRegistrar initialises the plugin's cached DNS registrar handle
+// for this deploy. The handler stores the Registrar on the Impl so later
+// NewDnsRecord / ProvisionDomainForEndpoint calls reuse it.
 //
-// Load-bearing: Pulumi fires RegisterResource from a goroutine, so a
-// handler that returns before its outputs resolve lets `defer pctx.Close`
-// tear the engine connection down mid-registration. The deploy hangs
-// with no error. waitForRef below is the countermeasure.
-func (p *echoPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.RequestHeader) (*sdk.Context, func(), error) {
-	if h.GetMonitorAddress() == "" {
-		return nil, nil, errors.New("no monitor address in request header")
-	}
-	pctx, err := sdk.NewContext(ctx, sdk.RunInfo{
-		MonitorAddr: h.GetMonitorAddress(),
-		Project:     h.GetProjectName(),
-		Stack:       h.GetStackName(),
-	})
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "open pulumi context from monitor address")
-	}
-	return pctx, func() { pctx.Close() }, nil
-}
-
-func (p *echoPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.ProvisionRegistrarRequest) (*scpluginv1.ProvisionRegistrarResponse, error) {
+// The runtime.NewContext + runtime.Settle pair is NON-OPTIONAL: without
+// Settle, pending RegisterResource goroutines are dropped on return and
+// SC core plans a destroy of every state entry on the next apply (trap
+// 7). WithLocalEngineFallback is what keeps a background ctx.Log.Warn
+// (e.g. from pulumi-aws's provider) from panicking when the header
+// carries no engine address (Addendum P).
+func (p *echoPlugin) ProvisionRegistrar(stdctx context.Context, req *scpluginv1.ProvisionRegistrarRequest) (resp *scpluginv1.ProvisionRegistrarResponse, err error) {
 	// A real registrar reads the deploying stack's `baseDnsZone` from
 	// req.GetBaseDnsZone() for its zone lookup — NOT its own configured
 	// zoneName, which is only a default. Getting this wrong is how a
@@ -148,16 +183,16 @@ func (p *echoPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.Pro
 	configZone := strVal(req.GetConfig()["zoneName"])
 	p.progress.Info("provision-registrar", fmt.Sprintf("initialising echo registrar; stack prefers %q (config default %q)", stackZone, configZone))
 
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := runtime.NewContext(stdctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	defer runtime.Settle(rctx, &resp, &err)
 
-	r, err := echoInternal.NewRegistrar(pctx, stackZone, configZone)
-	if err != nil {
-		p.progress.Error("provision-registrar", "init failed: "+err.Error())
-		return nil, errors.Wrap(err, "init echo registrar")
+	r, rerr := echoInternal.NewRegistrar(rctx.Pulumi, stackZone, configZone)
+	if rerr != nil {
+		p.progress.Error("provision-registrar", "init failed: "+rerr.Error())
+		return nil, errors.Wrap(rerr, "init echo registrar")
 	}
 	p.mu.Lock()
 	p.registrar = r
@@ -166,12 +201,18 @@ func (p *echoPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.Pro
 	return &scpluginv1.ProvisionRegistrarResponse{MainDomain: r.MainDomain()}, nil
 }
 
-func (p *echoPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecordRequest) (*scpluginv1.NewDnsRecordResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+// NewDnsRecord registers one DNS record against the plugin's cached
+// registrar. A composite plugin that proxies DNS to a *peer* plugin uses
+// the scCoreRegistrarBridge pattern below instead of calling the local
+// registrar — see that stub for the ctx.Export-as-forcing-function
+// pattern (trap 15).
+func (p *echoPlugin) NewDnsRecord(stdctx context.Context, req *scpluginv1.NewDnsRecordRequest) (resp *scpluginv1.NewDnsRecordResponse, err error) {
+	rctx, err := runtime.NewContext(stdctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	defer runtime.Settle(rctx, &resp, &err)
+
 	p.mu.Lock()
 	r := p.registrar
 	p.mu.Unlock()
@@ -179,10 +220,10 @@ func (p *echoPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRec
 		return nil, errors.New("NewDnsRecord called before ProvisionRegistrar")
 	}
 	p.progress.Info("dns-record", fmt.Sprintf("creating %s record %q → %q", req.GetRecordType(), req.GetRecordName(), req.GetValueResolved()))
-	urnStr, err := r.NewRecord(pctx, req.GetRecordName(), req.GetRecordType(), req.GetValueResolved())
-	if err != nil {
-		p.progress.Error("dns-record", fmt.Sprintf("record %q failed: %v", req.GetRecordName(), err))
-		return nil, err
+	urnStr, rerr := r.NewRecord(rctx.Pulumi, req.GetRecordName(), req.GetRecordType(), req.GetValueResolved())
+	if rerr != nil {
+		p.progress.Error("dns-record", fmt.Sprintf("record %q failed: %v", req.GetRecordName(), rerr))
+		return nil, rerr
 	}
 	p.progress.Info("dns-record", fmt.Sprintf("record %q registered (urn=%s)", req.GetRecordName(), urnStr))
 	return &scpluginv1.NewDnsRecordResponse{Urn: urnStr}, nil
@@ -190,42 +231,96 @@ func (p *echoPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRec
 
 // Provision is the catch-all RPC for a `type: X` resource whose plugin
 // advertises X in ResourceTypes. The echo stub registers a logical
-// ComponentResource — no cloud side-effects — and returns its URN.
+// ComponentResource, exports one placeholder output so an operator sees
+// HarvestExports fire, and returns the harvested Outputs on the
+// response.
 //
 // A real cloud resource constructs provider resources from
-// pulumi-<cloud>, which is why Schema's PulumiPlugins must advertise
-// those packages.
-func (p *echoPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+// pulumi-<cloud>, exports every value a `uses:` consumer would want (ARN,
+// endpoint, connection string, access key — the last one secret-flagged
+// via sdk.ToSecret), and returns the harvested map so SC core can
+// re-export onto the parent stack.
+//
+// Lose the `Outputs:` field on the response and every `uses:` consumer of
+// this resource type gets `output "<name>" not found on stack <parent>`
+// (trap 10). Lose the Secret flag inside HarvestExports and secret
+// outputs land plaintext in the parent stack root (trap 11 — the api
+// runtime handles that for you, do not route around it).
+func (p *echoPlugin) Provision(stdctx context.Context, req *scpluginv1.ProvisionRequest) (resp *scpluginv1.ProvisionResponse, err error) {
+	rctx, err := runtime.NewContext(stdctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	defer runtime.Settle(rctx, &resp, &err)
+
 	p.progress.Info("provision", fmt.Sprintf("provisioning echo resource %q (type %q)", req.GetResourceName(), req.GetResourceType()))
-	urnStr, err := echoInternal.ProvisionEcho(pctx, req.GetResourceType(), req.GetResourceName())
-	if err != nil {
-		p.progress.Error("provision", err.Error())
-		return nil, err
+	urnStr, perr := echoInternal.ProvisionEcho(rctx.Pulumi, req.GetResourceType(), req.GetResourceName())
+	if perr != nil {
+		p.progress.Error("provision", perr.Error())
+		return nil, perr
 	}
-	p.progress.Info("provision", fmt.Sprintf("resource %q registered (urn=%s)", req.GetResourceName(), urnStr))
-	return &scpluginv1.ProvisionResponse{Urn: urnStr}, nil
+
+	// Export at least one output so HarvestExports has something to carry
+	// across the wire. A real plugin exports per-resource outputs under
+	// unique keys — see `plugin/internal/registrar.go`'s doc on the
+	// URN-vs-export-key split (trap 13): the Pulumi URN name is anchored
+	// to stack identity, but export keys should include the
+	// operator-visible name a consumer would want to reference. The
+	// placeholder below uses the operator's resource name; swap for your
+	// cloud's real export shape.
+	rctx.Pulumi.Export(fmt.Sprintf("%s-echo-urn", req.GetResourceName()), sdk.String(urnStr))
+
+	outputs, herr := runtime.HarvestExports(stdctx, rctx.Pulumi)
+	if herr != nil {
+		return nil, errors.Wrap(herr, "harvest provision exports")
+	}
+
+	p.progress.Info("provision", fmt.Sprintf("resource %q registered (urn=%s, %d output(s))", req.GetResourceName(), urnStr, len(outputs)))
+	return &scpluginv1.ProvisionResponse{Urn: urnStr, Outputs: outputs}, nil
 }
 
 // ComputeProcess is called by SC core for each dependency resource a
 // consuming stack declares. The echo stub exercises the full
 // ComputeResultBuilder surface — plain + secret env vars, resource and
 // dependency template extensions — so an operator can see what crosses
-// the Phase 1e v2 wire. A real plugin's ComputeProcessor opens a
-// StackReference against ParentInfo (req.GetParentInfoJson), reads
-// previously-exported outputs, and translates them into env vars
-// consuming stacks use.
+// the Phase 1e v2 wire.
+//
+// Why the runtime helpers matter here:
+//
+//   - runtime.ParentInfoFromRequest decodes req.ParentInfoJson (JSON of
+//     pApi.ParentInfo), the only wire path for parent-stack reference
+//     metadata. The decode uses encoding/json because the sidecar packs
+//     it that way; a yaml.Unmarshal would silently land every field
+//     empty.
+//
+//   - runtime.ResourceInputForComputeProcess builds the api.ResourceInput
+//     a real driver reads, and swaps the child env for the parent's when
+//     ParentInfo.ParentEnv is set — so lookup keys under isolated stacks
+//     resolve against `<stack>--staging--<key>` (parent) rather than
+//     `<stack>--108b3f--<key>` (child). (Trap 12,
+//     forge-storage isolated deploy 2026-11-01.)
 //
 // What is NOT demonstrated here (not representable on the bus — see
 // pkg/plugin/compute.go doc): sdk.Resource dependencies, sdk.Output
-// values, pre/post-processors. Those stay in-plugin and apply against
-// the plugin's own sdk.Context before Build.
-func (p *echoPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
+// values, pre/post-processors. Those stay in-plugin and get applied
+// against the plugin's own sdk.Context before Build.
+func (p *echoPlugin) ComputeProcess(_ context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
 	p.progress.Info("compute-process", fmt.Sprintf("resource=%q type=%q", req.GetResourceName(), req.GetResourceType()))
+
+	// A real plugin decodes parent + builds the resource input for its
+	// driver here. The template just calls the helpers to prove the
+	// shape; the resolved values are not used by the echo stub but a
+	// derived plugin reads them.
+	parent, perr := runtime.ParentInfoFromRequest(req)
+	if perr != nil {
+		p.progress.Error("compute-process", "parent decode: "+perr.Error())
+		return nil, perr
+	}
+	if parent != nil && parent.ParentEnv != "" {
+		p.progress.Info("compute-process", fmt.Sprintf("parent env %q (child env %q)", parent.ParentEnv, req.GetHeader().GetEnvironment()))
+	}
+	_ = runtime.ResourceInputForComputeProcess(req, parent, map[string]any{})
+
 	resp, err := echoInternal.ComputeProcess(req)
 	if err != nil {
 		p.progress.Error("compute-process", err.Error())
@@ -261,21 +356,22 @@ func (p *echoPlugin) PreDestroy(ctx context.Context, req *scpluginv1.PreDestroyR
 // IP, deploy key), parses their outputs via plugin.OutputRefTo /
 // AddressOutput / PrivateKeyOf, and composes the VmHostBuilder chain.
 // See api/pkg/plugin/vmhosts.go for the builder surface.
-func (p *echoPlugin) VmHosts(ctx context.Context, req *scpluginv1.VmHostsRequest) (*scpluginv1.VmHostsResponse, error) {
+func (p *echoPlugin) VmHosts(stdctx context.Context, req *scpluginv1.VmHostsRequest) (resp *scpluginv1.VmHostsResponse, err error) {
 	p.progress.Info("vm-hosts", fmt.Sprintf("provisioning echo vm %q (driver=%s)", req.GetResourceName(), req.GetDriver()))
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
-	if err != nil {
-		return nil, err
-	}
-	defer done()
 
-	resp, err := echoInternal.VmHosts(pctx, req.GetResourceName())
+	rctx, err := runtime.NewContext(stdctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
-		p.progress.Error("vm-hosts", fmt.Sprintf("vm %q failed: %v", req.GetResourceName(), err))
 		return nil, err
 	}
-	p.progress.Info("vm-hosts", fmt.Sprintf("vm %q ready, %d host(s)", req.GetResourceName(), len(resp.GetHosts())))
-	return resp, nil
+	defer runtime.Settle(rctx, &resp, &err)
+
+	r, verr := echoInternal.VmHosts(rctx.Pulumi, req.GetResourceName())
+	if verr != nil {
+		p.progress.Error("vm-hosts", fmt.Sprintf("vm %q failed: %v", req.GetResourceName(), verr))
+		return nil, verr
+	}
+	p.progress.Info("vm-hosts", fmt.Sprintf("vm %q ready, %d host(s)", req.GetResourceName(), len(r.GetHosts())))
+	return r, nil
 }
 
 // LogStream drains the plugin's progress Publisher onto the gRPC stream.
@@ -300,16 +396,81 @@ func (p *echoPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv1
 }
 
 // strVal reads a string input from the plugin bus's typed input map.
-// Every plugin needs this — it's a six-line helper rather than a shared
-// api/ helper only because a cloud with a complex config generally wants
-// to lift the whole input map into a typed struct via decodeInputsAs[T],
-// and the two can't share.
+// Keep for simple field reads; for a config with nested maps or lists
+// use runtime.DecodeInputs[T any](req.GetInputs(), &target) instead —
+// it round-trips through scPlugin.InputsToPlain + yaml, which the
+// per-plugin scalar-only variants aws/mongodb/cloudru carried pre-cascade
+// lost on nested fields (trap 14).
 func strVal(v *scpluginv1.InputValue) string {
 	if v == nil {
 		return ""
 	}
 	return v.GetStringValue()
 }
+
+// scCoreRegistrarBridge is a COMMENTED STUB of the cross-plugin registrar
+// bridge pattern a composite plugin needs. The aws plugin delegates
+// NewDnsRecord / NewOverrideHeaderRule / ProvisionDomainForEndpoint to
+// the operator-configured registrar (typically `cloudflare`) via this
+// shape. Enable by uncommenting and wiring into the handler methods.
+//
+// # Trap 15 — the forcing-function pattern
+//
+// Every bridge method returns a `*api.ResourceOutput{Ref: urnOut}` where
+// `urnOut` is an ApplyT chain containing the PeerInvoke RPC. Callers in
+// aws / Lambda / ECS templates discard the ResourceOutput — they only
+// check the error. With no downstream consumer of `urnOut`, Pulumi SDK
+// DEAD-STRIPS the orphan Output chain and the PeerInvoke never fires.
+// The deploy reads green with the DNS record silently never registered.
+// Live-caught on forge-notifier run 41339900839 (2026-11-01); fixed in
+// sc-plugin-aws v2026.11.01-e377550.
+//
+// The fix is a `ctx.Export(unique-key, urnOut)` inside each bridge
+// method, as a forcing function. Keys must be unique per
+// (stack, resource/endpoint/rule) so stacks with multiple records don't
+// collide. Any ctx.Export works — the forcing function is the stack-
+// output evaluation.
+//
+/*
+import (
+	hplugin "github.com/hashicorp/go-plugin"
+	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
+)
+
+type scCoreRegistrarBridge struct {
+	peer       scPlugin.PeerClient
+	pluginName string
+}
+
+func (p *echoPlugin) newRegistrarBridge(stdctx context.Context, h *scpluginv1.RequestHeader, peerPluginName string) (*scCoreRegistrarBridge, error) {
+	peer, err := scPlugin.NewPeerClient(stdctx, p.broker, h)
+	if err != nil {
+		return nil, errors.Wrap(err, "dial SCCore for peer bridge")
+	}
+	return &scCoreRegistrarBridge{peer: peer, pluginName: peerPluginName}, nil
+}
+
+func (r *scCoreRegistrarBridge) NewDnsRecord(ctx *sdk.Context, stack api.StackParams, recordName, recordType string, target sdk.StringOutput) (*api.ResourceOutput, error) {
+	urnOut := target.ApplyT(func(resolvedTarget string) (string, error) {
+		resp, err := r.peer.NewDnsRecord(ctx.Context(), r.pluginName, &scpluginv1.NewDnsRecordRequest{
+			Header:        headerFromStack(ctx, stack),
+			RecordName:    recordName,
+			RecordType:    recordType,
+			ValueResolved: resolvedTarget,
+		})
+		if err != nil { return "", err }
+		return resp.GetUrn(), nil
+	}).(sdk.StringOutput)
+
+	// TRAP 15 FORCING FUNCTION — DO NOT REMOVE.
+	// Without this, callers that discard the ResourceOutput let Pulumi
+	// dead-strip the ApplyT and the PeerInvoke RPC never fires. The
+	// deploy reads green with no DNS record created.
+	ctx.Export(fmt.Sprintf("%s-%s-bridge-record-urn", stack.StackName, recordName), urnOut)
+
+	return &api.ResourceOutput{Ref: urnOut}, nil
+}
+*/
 
 // Reference used only to anchor the vm package import — a real plugin
 // uses vm.Drivers[name].ToProto in Schema(). Prevents an unused-import

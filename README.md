@@ -8,6 +8,12 @@ This repo is a **working** minimum-viable SC plugin:
 - Every RPC class on the SC plugin bus is implemented as a canned-success stub
   so you can grep for `echo`, replace it piece by piece, and run tests
   continuously as you swap in real cloud logic.
+- Every handler uses `api/pkg/plugin/runtime`'s `NewContext` + `Settle` +
+  `HarvestExports` — the shared scaffolding that encodes the fifteen named
+  traps the first five plugin extractions paid for (2026-10-18 → 2026-11-01).
+  See [`TRAPS.md`](TRAPS.md) for the index + checklist, and
+  [`forge/docs/design/2026-11-01/plugin-extraction-playbook/`](https://github.com/simple-container-com/forge/tree/main/docs/design/2026-11-01/plugin-extraction-playbook/)
+  for the canonical catalogue.
 - The release workflow in `.github/workflows/release.yml` carries the memory-
   pin that most SC plugin repos learned the hard way on their first release
   run (`GOMAXPROCS=1 GOMEMLIMIT=6GiB`, `go build -p 1`) — keep it even for a
@@ -74,16 +80,26 @@ sc-plugin-echo/
 
 ## Prior art
 
-The three live SC plugin repos were the sources this template was lifted from:
+Five live SC plugin repos were the sources this template was lifted from:
 
 - [`sc-plugin-cloudflare`](https://github.com/simple-container-com/sc-plugin-cloudflare) —
   simplest registrar-only plugin, cleanest `main.go` scaffolding.
 - [`sc-plugin-yandex`](https://github.com/simple-container-com/sc-plugin-yandex) —
   full provider+resource+state-store surface, origin of the release-workflow
-  OOM pins.
+  OOM pins AND the `settle()`/`finishPulumiContext()` pattern now packaged
+  in `api/pkg/plugin/runtime`.
 - [`sc-plugin-cloudru`](https://github.com/simple-container-com/sc-plugin-cloudru) —
   dual-mode binary (plugin + lifted cobra CLI), used for clouds with no
   Pulumi provider at all.
+- [`sc-plugin-mongodb`](https://github.com/simple-container-com/sc-plugin-mongodb) —
+  first ComputeProcess-heavy plugin + `PreDestroy` with a database-drop
+  hook. Also the origin of the URN-vs-export-key split (trap 13).
+- [`sc-plugin-aws`](https://github.com/simple-container-com/sc-plugin-aws) —
+  the biggest surface (provider + state-store + secrets-provider + three
+  templates + five resources). First plugin to use `BrokerAware` →
+  `PeerInvoke` to delegate DNS to cloudflare without a Go-module import.
+  Carries the collector-split (trap 14) and ApplyT-forcing-function
+  (trap 15) fixes.
 
 ## License
 

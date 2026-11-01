@@ -9,7 +9,6 @@ package echo
 
 import (
 	"github.com/pkg/errors"
-
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
@@ -77,6 +76,36 @@ func (r *Registrar) NewRecord(ctx *sdk.Context, recordName, recordType, value st
 // Provision RPC). Registers a logical ComponentResource and returns its
 // URN. A real plugin's Provision reads credentials from the request,
 // constructs cloud resources, and returns the URN of the top one.
+//
+// # Trap 13 — URN names anchor to stack identity, not operator knobs
+//
+// Pulumi state keys off the resource name baked into the URN. If a knob
+// an operator can turn (a `clusterName:` on a MongoDB cluster, a
+// `bucketName:` on an S3 bucket) flows into the second argument to
+// RegisterResource / NewResource below, renaming it on the next edit
+// changes the URN — Pulumi plans destroy+create, and every output your
+// plugin exported under the old name reads as "no longer in program"
+// and gets destroyed too (CNAMEs, derived SecretsManager entries,
+// anything that referenced the previous export shape). Live-caught on
+// forge-notifier run 41330569069 (2026-11-01); sc-plugin-mongodb
+// v2026.11.01-c9f5514 fixes this by splitting the URN name from the
+// export key.
+//
+// Pattern for a real plugin:
+//
+//	pulumiResourceName := toClusterName(stack.Name, input)   // URN-anchored, stable
+//	exportClusterName := pulumiResourceName
+//	if cfg.ClusterName != "" {
+//	    exportClusterName = cfg.ClusterName                  // operator-visible
+//	}
+//	cluster, _ := mongodbatlas.NewCluster(ctx,
+//	    fmt.Sprintf("%s-cluster", pulumiResourceName),       // URN uses stable name
+//	    &mongodbatlas.ClusterArgs{Name: sdk.StringPtr(exportClusterName)})
+//	ctx.Export(toClusterIdExport(exportClusterName), cluster.ClusterId)
+//
+// The echo stub uses resourceName (which is itself derived from stack
+// identity by SC core, so the invariant holds) — but a derived plugin
+// introducing an operator-nameable knob MUST split the two.
 func ProvisionEcho(ctx *sdk.Context, resourceType, resourceName string) (string, error) {
 	comp := &echoComponent{}
 	if err := ctx.RegisterComponentResource(

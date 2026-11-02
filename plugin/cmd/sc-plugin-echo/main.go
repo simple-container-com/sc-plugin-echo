@@ -360,6 +360,42 @@ func (p *echoPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Comp
 // not to run — SC core's sidecar is fire-and-forget on the response,
 // so an error here would only show up in the plugin's own log and
 // never block the destroy.
+// ConvertStackConfig is the plugin-side half of SC core's A2 path for
+// turning a merged StackConfig* into the plugin's typed Input. SC
+// core only dials this when the template type is plugin-owned
+// (api.IsPluginOwnedType returns a binding whose PluginName matches
+// this plugin). The echo template demonstrates the canonical shape:
+// read the InputValue tree, run the plugin's existing /api-side
+// ToXxxConfig closure (or an inline conversion), and marshal the
+// typed Input back as an InputValue tree.
+//
+// For a real plugin — sc-plugin-aws / cloudflare / yandex — the body
+// delegates to the previously-SC-core-registered converter closures
+// (ToStaticSiteConfig, ToPagesConfig, …), reads base_dns_zone / uses
+// / depends_on_resources off the resulting typed Input, and returns.
+// The ONLY structural change on the plugin side is implementing this
+// RPC.
+func (p *echoPlugin) ConvertStackConfig(_ context.Context, req *scpluginv1.ConvertStackConfigRequest) (*scpluginv1.ConvertStackConfigResponse, error) {
+	p.progress.Info("convert-stack-config", fmt.Sprintf("template=%q stack=%q dir=%q", req.GetTemplateType(), req.GetStackName(), req.GetStackDir()))
+
+	// Minimal response that exercises every field a real plugin
+	// would populate. A derived plugin replaces this with its real
+	// ToXxxConfig closure's output marshalled via scPlugin.PlainToInputs.
+	return &scpluginv1.ConvertStackConfigResponse{
+		Input: scPlugin.PlainToInputs(map[string]any{
+			"templateType": req.GetTemplateType(),
+			"stackName":    req.GetStackName(),
+			"stackDir":     req.GetStackDir(),
+		}),
+		BaseDnsZone: "echo.example.com",
+		Uses:        []string{"echo-bucket"},
+		// depends_on_resources: zero entries — the echo stub does not
+		// synthesise cross-stack dependencies. A real plugin json-marshals
+		// each api.StackConfigDependencyResource into the repeated bytes
+		// field.
+	}, nil
+}
+
 func (p *echoPlugin) PreDestroy(ctx context.Context, req *scpluginv1.PreDestroyRequest) (*scpluginv1.PreDestroyResponse, error) {
 	if err := echoInternal.PreDestroy(ctx, p.progress, req); err != nil {
 		p.progress.Error("pre-destroy", err.Error())

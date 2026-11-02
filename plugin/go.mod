@@ -8,7 +8,7 @@ require (
 	github.com/onsi/gomega v1.44.0
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
-	github.com/simple-container-com/api v0.0.0-20261102104601-6cb66e285422
+	github.com/simple-container-com/api v0.0.0-20261102142605-7a84b47744bf
 	github.com/simple-container-com/sc-plugin-echo/api v0.0.0
 )
 

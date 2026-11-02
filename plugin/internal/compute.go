@@ -6,52 +6,72 @@ package echo
 import (
 	"fmt"
 
-	scPlugin "github.com/simple-container-com/api/pkg/plugin"
-	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/simple-container-com/api/pkg/api"
+	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 )
 
-// ComputeProcess is the echo stub for the ComputeProcess RPC (Phase 1e,
-// ComputeProcessRequest/Response v2). A real plugin's ComputeProcessor
-// turns a resource's provisioning outputs into the shape consuming
-// stacks need — env vars, template extensions, dependency placeholders.
+// EchoComputeProcessor is the canonical ComputeProcessor shape every
+// real plugin's ComputeProcess body should wear. The main.go handler
+// never calls this function directly — it passes it to
+// runtime.RunComputeProcess, which owns the fn → drain → marshal
+// sequence and hands the typed response back.
 //
-// The echo stub exercises the full ComputeResultBuilder surface:
+// Writing a ComputeProcessor:
 //
-//   - one plain env var,
-//   - one secret env var,
-//   - one resource template extension,
-//   - one dependency template extension.
+//   - Everything you want to end up in the ComputeProcessResponse is
+//     written via the shared pApi.ComputeContextCollector:
+//     AddEnvVariableIfNotExist, AddSecretEnvVariableIfNotExist,
+//     AddResourceTplExtension, AddDependencyTplExtension.
 //
-// What is NOT demonstrated here (not representable on the bus — see
-// pkg/plugin/compute.go doc): AddDependency(sdk.Resource), AddOutput,
-// pre/post-processors. Those stay in-plugin and get applied against
-// the plugin's own sdk.Context before Build.
+//   - Env mutations that depend on resolved resource outputs (bucket
+//     name, user password, cluster connection string, …) run from
+//     INSIDE an ApplyT callback on that output, and the output is
+//     registered with the collector via collector.AddOutput(ctx, out)
+//     so the runtime's drain blocks on it before marshalling the
+//     response. The pattern below exercises that path — one direct env
+//     mutation plus one ApplyT-wrapped secret mutation.
 //
-// A real plugin:
+//   - DO NOT reimplement the collector in-plugin. The shared
+//     runtime.Collector's AddOutput captures the Output; its drain is
+//     package-private so a plugin author cannot forget to await.
+//     Writing a local capturingCollector reintroduces trap 16 (silent
+//     env-var drop; sc-plugin-aws S3 ComputeProcessor live-caught on
+//     agent-native-pdf-rendering run f4355798, 2026-11-02). See
+//     forge/docs/design/2026-11-01/plugin-extraction-playbook/ trap 16.
 //
-//  1. Reads ParentInfo (req.GetParentInfoJson(), JSON of pApi.ParentInfo)
-//     to open sdk.NewStackReference against the parent stack.
-//  2. Pulls previously-exported outputs (project id, connection
-//     strings) via the StackReference.
-//  3. Registers per-stack resources (DB user, random password) via its
-//     own sdk.Context, applying AddDependency/AddOutput as needed.
-//  4. Builds the response with the env vars / tpl extensions the
-//     consuming stack needs.
-func ComputeProcess(req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
-	resName := req.GetResourceName()
-	resType := req.GetResourceType()
-	stackName := req.GetHeader().GetStackName()
+//   - Return (*api.ResourceOutput, error). The ResourceOutput.Ref is
+//     opaque to the collector — SC core uses it to mint a response
+//     URN. For an echo stub there is no cloud resource to reference;
+//     return an sdk.StringOutput as a placeholder.
+func EchoComputeProcessor(ctx *sdk.Context, _ api.Stack, input api.ResourceInput, collector pApi.ComputeContextCollector, _ pApi.ProvisionParams) (*api.ResourceOutput, error) {
+	resName := input.Descriptor.Name
+	resType := input.Descriptor.Type
+	stackName := input.StackParams.StackName
 
-	return scPlugin.NewComputeResult().
-		Urn(fmt.Sprintf("echo-compute:%s:%s", resType, resName)).
-		EnvVar("ECHO_RESOURCE_NAME", resName, resType, resName, stackName).
-		SecretEnvVar("ECHO_SECRET_TOKEN", "replace-me-with-real-cloud-output", resType, resName, stackName).
-		ResourceTplExtension(resName, map[string]string{
-			"echoResourceName": resName,
-			"echoResourceType": resType,
-		}).
-		DependencyTplExtension("consumer", resName, map[string]string{
-			"echoStackName": stackName,
-		}).
-		Build()
+	// Direct mutation (no ApplyT) — the simple case. A plugin writes
+	// an env var whose value is already a plain string.
+	collector.AddEnvVariableIfNotExist("ECHO_RESOURCE_NAME", resName, resType, resName, stackName)
+
+	// ApplyT-wrapped mutation — the pattern that trap 16 silently
+	// broke in sc-plugin-aws. A real plugin would resolve the value
+	// off a resource's Output (bucket.ID(), user.Password, …); here
+	// we synthesise one via sdk.String so the shape runs in tests.
+	// The shared Collector's AddOutput captures the Output; the
+	// runtime's drain blocks on resolution before response marshal.
+	resolved := sdk.String("replace-me-with-real-cloud-output").ToStringOutput().ApplyT(func(value string) string {
+		collector.AddSecretEnvVariableIfNotExist("ECHO_SECRET_TOKEN", value, resType, resName, stackName)
+		return value
+	}).(sdk.StringOutput)
+	collector.AddOutput(ctx, resolved)
+
+	collector.AddResourceTplExtension(resName, map[string]string{
+		"echoResourceName": resName,
+		"echoResourceType": resType,
+	})
+	collector.AddDependencyTplExtension("consumer", resName, map[string]string{
+		"echoStackName": stackName,
+	})
+
+	return &api.ResourceOutput{Ref: sdk.String(fmt.Sprintf("echo-compute:%s:%s", resType, resName)).ToStringOutput()}, nil
 }

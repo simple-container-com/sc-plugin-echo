@@ -64,6 +64,8 @@ import (
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/simple-container-com/api/pkg/api"
+	"github.com/simple-container-com/api/pkg/api/logger"
+	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	"github.com/simple-container-com/api/pkg/clouds/vm"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
@@ -280,48 +282,66 @@ func (p *echoPlugin) Provision(stdctx context.Context, req *scpluginv1.Provision
 }
 
 // ComputeProcess is called by SC core for each dependency resource a
-// consuming stack declares. The echo stub exercises the full
-// ComputeResultBuilder surface — plain + secret env vars, resource and
-// dependency template extensions — so an operator can see what crosses
-// the Phase 1e v2 wire.
+// consuming stack declares. The echo template demonstrates the
+// canonical shape every real plugin's ComputeProcess body should
+// wear: open an sdk.Context, decode the parent + input helpers, hand
+// a ComputeProcessor to runtime.RunComputeProcess, and let the shared
+// library own the drain + marshal sequence.
 //
-// Why the runtime helpers matter here:
+// Why RunComputeProcess, not a hand-rolled collector:
+//
+//   - The shared runtime.Collector captures sdk.Output chains passed
+//     via AddOutput and the drain blocks on them BEFORE marshalling
+//     the response. A per-plugin reimplementation that forgot to
+//     capture (AddOutput as a no-op) silently discards every
+//     ApplyT-wrapped env mutation — trap 16, live-caught 2026-11-02
+//     on sc-plugin-aws's S3 processor (agent-native-pdf-rendering
+//     f4355798). The shared library's drain is package-private, so a
+//     plugin author CANNOT forget by construction.
 //
 //   - runtime.ParentInfoFromRequest decodes req.ParentInfoJson (JSON of
 //     pApi.ParentInfo), the only wire path for parent-stack reference
-//     metadata. The decode uses encoding/json because the sidecar packs
-//     it that way; a yaml.Unmarshal would silently land every field
-//     empty.
+//     metadata. The decode uses encoding/json; a yaml.Unmarshal would
+//     silently land every field empty.
 //
 //   - runtime.ResourceInputForComputeProcess builds the api.ResourceInput
-//     a real driver reads, and swaps the child env for the parent's when
-//     ParentInfo.ParentEnv is set — so lookup keys under isolated stacks
-//     resolve against `<stack>--staging--<key>` (parent) rather than
-//     `<stack>--108b3f--<key>` (child). (Trap 12,
-//     forge-storage isolated deploy 2026-11-01.)
+//     a real driver reads, and swaps the child env for the parent's
+//     when ParentInfo.ParentEnv is set — so lookup keys under isolated
+//     stacks resolve against `<stack>--staging--<key>` (parent) rather
+//     than `<stack>--108b3f--<key>` (child). (Trap 5, forge-storage
+//     isolated deploy 2026-11-01.)
 //
 // What is NOT demonstrated here (not representable on the bus — see
-// pkg/plugin/compute.go doc): sdk.Resource dependencies, sdk.Output
-// values, pre/post-processors. Those stay in-plugin and get applied
-// against the plugin's own sdk.Context before Build.
-func (p *echoPlugin) ComputeProcess(_ context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
+// pkg/plugin/compute.go doc): sdk.Resource dependencies via
+// AddDependency, pre/post-processors. Those stay in-plugin and get
+// applied against the plugin's own sdk.Context before Build.
+func (p *echoPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.ComputeProcessRequest) (resp *scpluginv1.ComputeProcessResponse, err error) {
+	rctx, err := runtime.NewContext(stdctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.Settle(rctx, &resp, &err)
 	p.progress.Info("compute-process", fmt.Sprintf("resource=%q type=%q", req.GetResourceName(), req.GetResourceType()))
 
-	// A real plugin decodes parent + builds the resource input for its
-	// driver here. The template just calls the helpers to prove the
-	// shape; the resolved values are not used by the echo stub but a
-	// derived plugin reads them.
-	parent, perr := runtime.ParentInfoFromRequest(req)
-	if perr != nil {
-		p.progress.Error("compute-process", "parent decode: "+perr.Error())
-		return nil, perr
+	parent, err := runtime.ParentInfoFromRequest(req)
+	if err != nil {
+		p.progress.Error("compute-process", "parent decode: "+err.Error())
+		return nil, err
 	}
 	if parent != nil && parent.ParentEnv != "" {
 		p.progress.Info("compute-process", fmt.Sprintf("parent env %q (child env %q)", parent.ParentEnv, req.GetHeader().GetEnvironment()))
 	}
-	_ = runtime.ResourceInputForComputeProcess(req, parent, map[string]any{})
+	input := runtime.ResourceInputForComputeProcess(req, parent, map[string]any{})
 
-	resp, err := echoInternal.ComputeProcess(req)
+	// Drain + marshal are OWNED by RunComputeProcess. A plugin author
+	// cannot forget to await captured outputs — toResponse and
+	// awaitOutputs are package-private in api/pkg/plugin/runtime.
+	resp, _, err = runtime.RunComputeProcess(
+		stdctx, rctx,
+		api.Stack{Name: req.GetHeader().GetStackName()}, input,
+		pApi.ProvisionParams{Log: logger.New(), ParentStack: parent},
+		echoInternal.EchoComputeProcessor,
+	)
 	if err != nil {
 		p.progress.Error("compute-process", err.Error())
 		return nil, err
